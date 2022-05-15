@@ -3,6 +3,7 @@ use std::mem::swap;
 use std::time::*;
 use std::cmp::max;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 
 use std::sync::{ Arc, Mutex };
 use crossbeam::thread;
@@ -20,7 +21,7 @@ impl Bitmap
     pub fn new(size: usize) -> Bitmap
     {
         let vec_size = (size - 1) / 64 + 1;
-        let data = Vec::with_capacity(vec_size);
+        let mut data = Vec::with_capacity(vec_size);
         data.resize(vec_size, 0u64);
         Bitmap {
             data, size, vec_size,
@@ -29,13 +30,13 @@ impl Bitmap
 
     pub fn clear(&mut self)
     {
-        data.clear();
-        data.resize(vec_size, 0);
+        self.data.clear();
+        self.data.resize(self.vec_size, 0);
     }
 
     pub fn get_bit(&self, index: usize) -> bool
     {
-        data[index / 64] & (1 << (index & (64-1)))
+        self.data[index / 64] & (1 << (index & (64-1))) != 0
     }
 
     pub fn set_bit(&mut self, index: usize, value: bool)
@@ -91,9 +92,9 @@ impl Connection
 #[derive(Debug)]
 pub struct Group
 {
-    group: Vec<Node>,
+    nodes: Vec<Node>,
     bitmap: Bitmap,
-    group_has_value: GroupValue,
+    value: GroupValue,
 
     cache: Vec<HashMap<u64, HashResult>>,
 }
@@ -105,44 +106,50 @@ impl Group
     pub fn new(nodes_count: usize) -> Group
     {
         Group { 
-            group: Vec::with_capacity(CAPACITY),
+            nodes: Vec::with_capacity(CAPACITY),
             bitmap: Bitmap::new(nodes_count),
-            group_has_value: GroupValue::Nothing,
+            value: GroupValue::Nothing,
 
             cache: Vec::with_capacity(nodes_count),
         }
     }
 
-    #[inline]
-    fn group_add(&mut self, node: Node)
+    fn contains(&self, node: Node) -> bool
     {
-        self.group.push(node);
-        self.group_contains[node] = true;
+        self.bitmap.get_bit(node)
     }
 
     #[inline]
-    fn group_clear(&mut self, state: &State)
+    fn add(&mut self, node: Node)
     {
-        //let n = Instant::now();
-        self.group.clear();
-        self.group_has_value = GroupValue::Nothing;
-        // if we use memset here it'll be faster i think
-        self.group_contains.clear();
-        self.group_contains.resize(state.nodes_count, false);
+        self.nodes.push(node);
+        self.bitmap.set_bit(node, true);
     }
 
     #[inline]
-    pub fn group_value(&self) -> bool
+    fn clear(&mut self, state: &State)
     {
-        match self.group_has_value
+        self.nodes.clear();
+        self.value = GroupValue::Nothing;
+        self.bitmap.clear();
+    }
+
+    #[inline]
+    pub fn binary_value(&self) -> bool
+    {
+        match self.value
         {
             GroupValue::Vcc | GroupValue::Pullup | GroupValue::High => true,
             GroupValue::Vss | GroupValue::Pulldown | GroupValue::Nothing => false,
         }
     }
 
-
     pub fn add_node_to_group(&mut self, state: &State, node: Node)
+    {
+        let h = DefaultHasher::new();
+    }
+
+    pub fn add_node_to_group_old(&mut self, state: &State, node: Node)
     {
         // somehow the non-recursive version is slower lol
         //const CAP: usize = 5;
@@ -153,44 +160,44 @@ impl Group
         //{
             if node == state.vss
             {
-                self.group_has_value = GroupValue::Vss;
+                self.value = GroupValue::Vss;
                 //continue;
                 return;
             }
             
             if node == state.vcc
             {
-                if self.group_has_value != GroupValue::Vss
+                if self.value != GroupValue::Vss
                 {
-                    self.group_has_value = GroupValue::Vcc;
+                    self.value = GroupValue::Vcc;
                 }
                 //continue;
                 return;
             }
             
            
-            if self.group_contains(node)
+            if self.contains(node)
             {
                 //println!("why are we here");
                 //continue;
                 return;
             }
             
-            self.group_add(node);
+            self.add(node);
 
             if state.node_is_pulldown(node)
             {
-                self.group_has_value = max(GroupValue::Pulldown, self.group_has_value);
+                self.value = max(GroupValue::Pulldown, self.value);
             }
             else if state.node_is_pullup(node)
             {
-                self.group_has_value = max(GroupValue::Pullup, self.group_has_value);
+                self.value = max(GroupValue::Pullup, self.value);
             }
             
-            if self.group_has_value < GroupValue::High && state.node_value[node]
+            if self.value < GroupValue::High && state.node_value(node)
             {
                 // node is not pull up but is high
-                self.group_has_value = GroupValue::High;
+                self.value = GroupValue::High;
             } 
 
             /*if state.node_connections[node].iter()
@@ -202,9 +209,9 @@ impl Group
             
 
             for c in state.get_connections(node).iter()
-                        .filter(|c| state.tran_is_on[c.t])
+                        .filter(|c| state.tran_is_on(c.t))
             {
-                //if !self.group_contains[c.other]
+                //if !self.contains[c.other]
                 //{
                     self.add_node_to_group(state, c.other);
                 //}
@@ -229,9 +236,9 @@ pub struct State
     vcc: Node,
 
     // - Node Data
-    node_is_pullup: Vec<bool>,
-    node_is_pulldown: Vec<bool>,
-    node_value: Vec<bool>,
+    node_is_pullup: Bitmap,
+    node_is_pulldown: Bitmap,
+    node_value: Bitmap,
 
     // Gates that this node is connected to
     node_gates: Vec<Vec<Tran>>,
@@ -249,7 +256,7 @@ pub struct State
     tran_gate: Vec<Node>,
     tran_a: Vec<Node>,
     tran_b: Vec<Node>,
-    tran_is_on: Vec<bool>,
+    tran_is_on: Bitmap,
 
 
     // Nodes that we're working on
@@ -276,14 +283,9 @@ impl State
             vss,
             vcc,
 
-            node_is_pullup:
-                pullup.into_iter()
-                .map(|x| *x > 0)
-                .collect::<Vec<bool>>(),
-        
-            node_is_pulldown: vec![false; nodes_count],  
-
-            node_value: vec![false; nodes_count],
+            node_is_pullup: Bitmap::new(nodes_count),
+            node_is_pulldown: Bitmap::new(nodes_count),
+            node_value: Bitmap::new(nodes_count),
 
             node_gates: vec![Vec::with_capacity(CAPACITY); nodes_count],
 
@@ -296,12 +298,15 @@ impl State
             tran_gate: trans.into_iter().map(|t| t.0).collect(),
             tran_a: trans.into_iter().map(|t| t.1).collect(),
             tran_b: trans.into_iter().map(|t| t.2).collect(),
-            tran_is_on: vec![false; trans_count],
+            tran_is_on: Bitmap::new(trans_count),
 
             current: Vec::new(),
             queue: Vec::new(),
 
         };
+
+        pullup.iter().enumerate()
+            .for_each(|(i,&x)| s.node_is_pullup.set_bit(i, x>0));
 
         let mut c_count = vec![0usize; nodes_count];
 
@@ -370,6 +375,27 @@ impl State
         s
     }
 
+
+    pub fn node_is_pulldown(&self, node: Node) -> bool
+    {
+        self.node_is_pulldown.get_bit(node)
+    }
+
+    pub fn node_is_pullup(&self, node: Node) -> bool
+    {
+        self.node_is_pullup.get_bit(node)
+    }
+
+    pub fn node_value(&self, node: Node) -> bool
+    {
+        self.node_value.get_bit(node)
+    }
+
+    pub fn tran_is_on(&self, node: Node) -> bool
+    {
+        self.tran_is_on.get_bit(node)
+    }
+    
     #[inline]
     fn get_connections(&self, node: Node) -> &[Connection]
     {
@@ -393,22 +419,22 @@ impl State
     #[inline]
     pub fn recalc_node(&mut self, node: Node, mut group: &mut Group)
     {
-        group.group_clear(&self);
+        group.clear(&self);
 
         group.add_node_to_group(self, node);
         
-        let newv = group.group_value();
+        let newv = group.binary_value();
         // set all nodes to the group state
         // check and switch all the transistors connected
         // collect all nodes connected to those transistors
-        for n in &group.group
+        for n in group.nodes.iter()
         {
-             if self.node_value[*n] != newv
+             if self.node_value(*n) != newv
              {
-                self.node_value[*n] = newv;
+                self.node_value.set_bit(*n, newv);
                 for t in &self.node_gates[*n]
                 {
-                    self.tran_is_on[*t] = newv;
+                    self.tran_is_on.set_bit(*t, newv);
                 }
 
                 let depend = if newv 
@@ -462,13 +488,14 @@ impl State
     #[inline]
     pub fn set_node(&mut self, node: Node, v: bool, group: &mut Group)
     {
-        self.node_is_pullup[node] = v;
-        self.node_is_pulldown[node] = !v;
+        self.node_is_pullup.set_bit(node, v);
+        self.node_is_pulldown.set_bit(node, !v);
         self.queue.push(node);
 
         self.recalc_node_list(group);
     }
 
+    /*
     #[inline]
     pub fn set_node_no_recalc(&mut self, node: Node, v: bool)
     {
@@ -476,7 +503,7 @@ impl State
         self.node_is_pulldown[node] = !v;
         self.queue.push(node);
     }
-
+    */
     #[inline]
     pub fn read_nodes(&self, list: &[Node]) -> u16
     {
@@ -484,7 +511,7 @@ impl State
         for n in list
         {
             result <<= 1;
-            result |= self.node_value[*n] as u16;
+            result |= self.node_value(*n) as u16;
         }
         result
     }
@@ -492,7 +519,7 @@ impl State
     #[inline]
     pub fn read_node(&self, node: Node) -> bool
     {
-        self.node_value[node]
+        self.node_value(node)
     }
     
 
@@ -501,7 +528,7 @@ impl State
     {
         for n in list.iter().rev()
         {
-            self.set_node_no_recalc(*n, (value & 1) != 0);
+            self.set_node(*n, (value & 1) != 0, group);
             value >>= 1;
         }
         self.recalc_node_list(group);

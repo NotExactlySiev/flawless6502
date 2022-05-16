@@ -4,11 +4,12 @@ use std::time::*;
 use std::cmp::max;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::hash::{ Hash, Hasher };
 
 use std::sync::{ Arc, Mutex };
 use crossbeam::thread;
 
-#[derive(Debug)]
+#[derive(Debug, Hash)]
 struct Bitmap
 {
     data: Vec<u64>,
@@ -54,7 +55,7 @@ impl Bitmap
 
 }
 
-#[derive(PartialEq, PartialOrd, Eq, Ord, Debug, Clone, Copy)]
+#[derive(PartialEq, PartialOrd, Eq, Ord, Debug, Clone, Copy, Hash)]
 enum GroupValue
 {
     Nothing,
@@ -66,7 +67,7 @@ enum GroupValue
 }
 
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct HashResult
 {
     next: Vec<Node>,
@@ -110,7 +111,7 @@ impl Group
             bitmap: Bitmap::new(nodes_count),
             value: GroupValue::Nothing,
 
-            cache: Vec::with_capacity(nodes_count),
+            cache: vec![HashMap::new(); nodes_count],
         }
     }
 
@@ -124,6 +125,15 @@ impl Group
     {
         self.nodes.push(node);
         self.bitmap.set_bit(node, true);
+    }
+
+    fn remove(&mut self, node: Node)
+    {
+        if let Some(i) = self.nodes.iter().position(|&x| x == node)
+        {
+            self.nodes.remove(i);
+            self.bitmap.set_bit(node, false);
+        }
     }
 
     #[inline]
@@ -144,20 +154,226 @@ impl Group
         }
     }
 
+    #[inline]
+    fn node_status(&self, state: &State, node: Node) -> (bool,bool,bool,bool,Vec<bool>)
+    {
+        (state.node_value(node),
+         state.node_is_pulldown(node),
+         state.node_is_pullup(node),
+         self.contains(node),
+         state.get_connections(node).iter().map(|c| state.tran_is_on(c.t)).collect())
+    }
+
+    // only simulates what happens if we add node. doesn't change state
+    pub fn dry_run(&self, state: &State, node: Node, mut val: GroupValue)
+        -> (bool, Option<Vec<Node>>, GroupValue)
+    {
+        if node == state.vss
+        {
+            val = GroupValue::Vss;
+            return (false, None, val);
+        }
+
+        if node == state.vcc
+        {
+            if val != GroupValue::Vss
+            {
+                val = GroupValue::Vcc;
+            }
+            return (false, None, val);
+        }
+
+        if self.contains(node)
+        {
+            return (false, None, val);
+        }
+
+        // after this point the node will be added
+
+        if state.node_is_pulldown(node)
+        {
+            val = max(GroupValue::Pulldown, val);
+        }
+
+        if state.node_is_pullup(node)
+        {
+            val = max(GroupValue::Pullup, val);
+        }
+
+        if val < GroupValue::High && state.node_value(node)
+        {
+            val = GroupValue::High;
+        }
+
+        let mut next = state.get_connections(node).iter()
+            .filter(|c| state.tran_is_on(c.t))
+            .map(|c| c.other).collect::<Vec<Node>>();
+
+        next.sort();
+        next.dedup();
+
+
+        (true, Some(next), val)
+    }
+
     pub fn add_node_to_group(&mut self, state: &State, node: Node)
     {
-        let h = DefaultHasher::new();
+        //let n = Instant::now();
+
+        // First: calculate the hash for the state of this node
+        let mut h = DefaultHasher::new();
+
+        self.value.hash(&mut h);
+        self.node_status(state, node).hash(&mut h);        
+        let hood = state.get_connections(node).iter();
+
+        for s in hood.filter(|c| state.tran_is_on(c.t))
+            .map(|c| self.node_status(state, c.other))
+        {
+            s.hash(&mut h);
+        }
+
+        let hash = h.finish();
+
+        // Second: if this exact state has already been simulated,
+        //         just use the previous result to advance 2 steps
+        if self.cache[node].contains_key(&hash)
+        {
+            println!("key for {} exists now!", node);
+            let result = &self.cache[node][&hash].clone();
+
+            //println!("{:?}", result);
+
+            self.value = result.new_value;
+
+            for &n in result.inside.iter()
+            {
+                //println!("new node: {}", n);
+                self.add(n);
+            }
+
+            for &n in result.next.iter()
+            {
+                self.add_node_to_group(state, n);
+            }
+
+            return;
+        }
+
+        // Otherwise: simulate it and cache the result for the next time
+        //let n = Instant::now();
+
+        //// run the simulation twice, once on the current node,
+        //// and once on all the nodes connected to it. this way we
+        //// cache 2 steps of the simulation in one hash
+        let (added, middle, mut new_val) = self.dry_run(state, node, self.value);
+
+        let mut new: Vec<Node> = vec![];
+        let mut next: Vec<Node> = vec![];
+
+        if added
+        {
+            new.push(node); 
+        }
+
+        if let Some(half) = middle
+        {
+            if half.len() > 0
+            {
+
+            // run the simulation on all the connected nodes. combine
+            // all the results from all of them. this reduces overall
+            // redundancy.
+
+            let next_gen = half.iter()
+                .map(|&n| (n, self.dry_run(state, n, new_val)));
+
+            let next_gen_val = next_gen.clone()
+                .map(|r| r.1.2).max().unwrap_or(GroupValue::Nothing);
+            
+            let nodes = half.iter();
+
+            let next_gen_inside = next_gen.clone()
+                .filter(|r| r.1.0)
+                .map(|r| r.0);
+
+            
+            let mut next_gen_next = next_gen
+                .filter(|r| r.1.1 != None)
+                .map(|r| r.1.1.unwrap()) // this really shouldn't crash
+                .collect::<Vec<Vec<Node>>>()
+                .concat();
+
+            next_gen_next.sort();
+            next_gen_next.dedup();
+            if let Some(i) = next_gen_next.iter().position(|&x| x == node)
+            {
+                next_gen_next.remove(i);
+            }
+
+            new.extend(next_gen_inside);
+            
+            next.extend(next_gen_next);
+
+
+            new_val = next_gen_val;
+
+
+            }
+        }
+
+        let hash_result = HashResult {
+                                inside: new,
+                                next,
+                                new_value: new_val,
+                            };
+        
+        //println!("{}: {:?}", node, hash_result);        
+        /*
+        if self.cache[node].contains_key(&hash)
+        {
+            let result = self.cache[node][&hash].clone();
+
+            if result != hash_result
+            {
+                println!("{:?}\n{:?}",result, hash_result);
+                panic!();
+            }
+*/
+            //println!("{:?}", result);
+
+            self.value = hash_result.new_value;
+
+
+
+            for &n in hash_result.inside.iter()
+            {
+                //println!("new node: {}", n);
+                self.add(n);
+            }
+
+            for &n in hash_result.next.iter()
+            {
+                self.add_node_to_group(state, n);
+            }
+
+            return;
+        //}
+        //self.cache[node].insert(hash, hash_result);
+        // we fucking did it. we did 2 generations without touching the state
+
+        //println!("we created new thing. it is {:?}", self.cache[node][&hash]);
+
+        //println!("dry run took {} us", n.elapsed().as_micros());
+        //let n = Instant::now();
+
+        //self.add_node_to_group_old(state, node);
+        //println!("old method took {} us", n.elapsed().as_micros());
+        //self.add_node_to_group(state, node);
     }
 
     pub fn add_node_to_group_old(&mut self, state: &State, node: Node)
     {
-        // somehow the non-recursive version is slower lol
-        //const CAP: usize = 5;
-        //let mut stack = Vec::with_capacity(CAP);
-        //stack.push(node);
-
-        //while let Some(node) = stack.pop()
-        //{
             if node == state.vss
             {
                 self.value = GroupValue::Vss;
@@ -175,11 +391,8 @@ impl Group
                 return;
             }
             
-           
             if self.contains(node)
             {
-                //println!("why are we here");
-                //continue;
                 return;
             }
             
@@ -200,30 +413,11 @@ impl Group
                 self.value = GroupValue::High;
             } 
 
-            /*if state.node_connections[node].iter()
-                .filter(|c| state.tran_is_on[c.t])
-                .count() < 3
-            {
-                
-            }*/
-            
-
             for c in state.get_connections(node).iter()
-                        .filter(|c| state.tran_is_on(c.t))
+                .filter(|c| state.tran_is_on(c.t))
             {
-                //if !self.contains[c.other]
-                //{
-                    self.add_node_to_group(state, c.other);
-                //}
+                self.add_node_to_group_old(state, c.other);
             }
-            /*
-            state.node_connections[node].iter()
-                .filter(|c| state.tran_is_on[c.t])
-                .for_each(|c| self.add_node_to_group(&state, c.other));
-            */
-        
-      //  }
-    
     }
 }
 
@@ -420,10 +614,9 @@ impl State
     pub fn recalc_node(&mut self, node: Node, mut group: &mut Group)
     {
         group.clear(&self);
-
         group.add_node_to_group(self, node);
-        
-        let newv = group.binary_value();
+
+            let newv = group.binary_value();
         // set all nodes to the group state
         // check and switch all the transistors connected
         // collect all nodes connected to those transistors

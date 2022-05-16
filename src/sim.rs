@@ -239,16 +239,12 @@ impl Group
         //         just use the previous result to advance 2 steps
         if self.cache[node].contains_key(&hash)
         {
-            println!("key for {} exists now!", node);
             let result = &self.cache[node][&hash].clone();
-
-            //println!("{:?}", result);
 
             self.value = result.new_value;
 
             for &n in result.inside.iter()
             {
-                //println!("new node: {}", n);
                 self.add(n);
             }
 
@@ -293,17 +289,19 @@ impl Group
             
             let nodes = half.iter();
 
+            // nodes that join the group
             let next_gen_inside = next_gen.clone()
                 .filter(|r| r.1.0)
                 .map(|r| r.0);
 
-            
+            // nodes that need to be simulated next
             let mut next_gen_next = next_gen
                 .filter(|r| r.1.1 != None)
                 .map(|r| r.1.1.unwrap()) // this really shouldn't crash
                 .collect::<Vec<Vec<Node>>>()
                 .concat();
 
+            // get rid of repeats
             next_gen_next.sort();
             next_gen_next.dedup();
             if let Some(i) = next_gen_next.iter().position(|&x| x == node)
@@ -312,64 +310,27 @@ impl Group
             }
 
             new.extend(next_gen_inside);
-            
             next.extend(next_gen_next);
 
-
             new_val = next_gen_val;
-
 
             }
         }
 
+        // finally we have the result of the two step simulation
+        // cache it in the hashmap to be used the next time
         let hash_result = HashResult {
                                 inside: new,
                                 next,
                                 new_value: new_val,
                             };
+
+        self.cache[node].insert(hash, hash_result);
         
-        //println!("{}: {:?}", node, hash_result);        
-        /*
-        if self.cache[node].contains_key(&hash)
-        {
-            let result = self.cache[node][&hash].clone();
 
-            if result != hash_result
-            {
-                println!("{:?}\n{:?}",result, hash_result);
-                panic!();
-            }
-*/
-            //println!("{:?}", result);
-
-            self.value = hash_result.new_value;
-
-
-
-            for &n in hash_result.inside.iter()
-            {
-                //println!("new node: {}", n);
-                self.add(n);
-            }
-
-            for &n in hash_result.next.iter()
-            {
-                self.add_node_to_group(state, n);
-            }
-
-            return;
-        //}
-        //self.cache[node].insert(hash, hash_result);
-        // we fucking did it. we did 2 generations without touching the state
-
-        //println!("we created new thing. it is {:?}", self.cache[node][&hash]);
-
-        //println!("dry run took {} us", n.elapsed().as_micros());
-        //let n = Instant::now();
-
-        //self.add_node_to_group_old(state, node);
-        //println!("old method took {} us", n.elapsed().as_micros());
-        //self.add_node_to_group(state, node);
+        // finally call the function again. this time we have the
+        // hash result and it'll be applied to the group
+        self.add_node_to_group(state, node);
     }
 
     pub fn add_node_to_group_old(&mut self, state: &State, node: Node)

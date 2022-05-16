@@ -51,7 +51,7 @@ fn main() {
     
     let n = Instant::now();
 
-    const CYCLES: u32 = 200_000;
+    const CYCLES: u32 = 100000;
     const THRESHOLD: u32 = 1000;
 
     let mut cycle = 0;
@@ -91,9 +91,9 @@ fn main() {
         }
 
 
-        if cycle % 100000 == 0
+        if cycle % 10000 == 0
         {
-            println!("Current PC: 0x{:X}", cpu.read_pc());
+            println!("Current PC: 0x{:X} - Cycle {}", cpu.read_pc(), cycle/2);
         }
 
         cycle += 1;

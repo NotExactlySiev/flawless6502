@@ -2,12 +2,9 @@ use crate::types::*;
 use std::mem::swap;
 use std::time::*;
 use std::cmp::max;
-use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{ Hash, Hasher };
-
-use std::sync::{ Arc, Mutex };
-use crossbeam::thread;
+use ahash::{ AHashMap };
+use std::thread;
+use std::sync::Arc;
 
 #[derive(Debug, Hash)]
 struct Bitmap
@@ -55,18 +52,6 @@ impl Bitmap
 
 }
 
-#[derive(PartialEq, PartialOrd, Eq, Ord, Debug, Clone, Copy, Hash)]
-enum GroupValue
-{
-    Nothing,
-    High,
-    Pullup,
-    Pulldown,
-    Vcc,
-    Vss,
-}
-
-
 #[derive(Debug, Clone, PartialEq)]
 struct HashResult
 {
@@ -97,7 +82,7 @@ pub struct Group
     bitmap: Bitmap,
     value: GroupValue,
 
-    cache: Vec<HashMap<u64, HashResult>>,
+    cache: Vec<AHashMap<u64, HashResult>>,
 }
 
 const CAPACITY: usize = 50;
@@ -111,7 +96,7 @@ impl Group
             bitmap: Bitmap::new(nodes_count),
             value: GroupValue::Nothing,
 
-            cache: vec![HashMap::new(); nodes_count],
+            cache: vec![AHashMap::new(); nodes_count],
         }
     }
 
@@ -155,13 +140,24 @@ impl Group
     }
 
     #[inline]
-    fn node_status(&self, state: &State, node: Node) -> (bool,bool,bool,bool,Vec<bool>)
+    fn node_status(&self, state: &State, node: Node) -> u64
     {
-        (state.node_value(node),
-         state.node_is_pulldown(node),
-         state.node_is_pullup(node),
-         self.contains(node),
-         state.get_connections(node).iter().map(|c| state.tran_is_on(c.t)).collect())
+        // hood size is less than 32
+        let hood = state.get_connections(node);
+        let size = hood.len();
+
+        let mut bitmap: u64 = 0;
+        
+        for c in hood.iter()
+        {
+            bitmap <<= 1;
+            bitmap += state.tran_is_on(c.t) as u64;
+        }
+
+           ((state.node_value(node) as u64) << size)
+         | ((state.node_is_pulldown(node) as u64) << (size + 1))
+         | ((state.node_is_pullup(node) as u64) << (size + 2))
+         | ((self.contains(node) as u64) << (size + 3))
     }
 
     // only simulates what happens if we add node. doesn't change state
@@ -220,25 +216,37 @@ impl Group
     {
         //let n = Instant::now();
 
-        // First: calculate the hash for the state of this node
-        let mut h = DefaultHasher::new();
+        // First: collect all the data describing the current state
+        //        of this node of its immediate neighbours
 
-        self.value.hash(&mut h);
-        self.node_status(state, node).hash(&mut h);        
         let hood = state.get_connections(node).iter();
 
-        for s in hood.filter(|c| state.tran_is_on(c.t))
-            .map(|c| self.node_status(state, c.other))
+
+        if hood.len() < 10 || hood.len() > 32 
         {
-            s.hash(&mut h);
+            self.add_node_to_group_old(state, node);
+            return;
         }
 
-        let hash = h.finish();
+       
+        let mut hash: u64 = 0;
+        
+        hash += self.value as u64;
+        hash <<= 3;
+        hash += self.node_status(state, node);
+
+        for h in hood.filter(|c| state.tran_is_on(c.t))
+            .map(|c| self.node_status(state, c.other))
+        {
+            hash *= h;  
+            hash <<= 4;
+        }
 
         // Second: if this exact state has already been simulated,
         //         just use the previous result to advance 2 steps
         if self.cache[node].contains_key(&hash)
         {
+            //println!("using hash!");
             let result = &self.cache[node][&hash].clone();
 
             self.value = result.new_value;

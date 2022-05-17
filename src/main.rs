@@ -1,5 +1,7 @@
 #![feature(scoped_threads)]
 
+#![allow(nonuppercaseglobals)]
+
 mod cpu6502;
 mod sim;
 mod types;
@@ -51,7 +53,7 @@ fn main() {
     
     let n = Instant::now();
 
-    const CYCLES: u32 = 100000;
+    const CYCLES: u32 = 20000;
     const THRESHOLD: u32 = 1000;
 
     let mut cycle = 0;
@@ -91,7 +93,7 @@ fn main() {
         }
 
 
-        if cycle % 10000 == 0
+        if cycle % 2000 == 0
         {
             println!("Current PC: 0x{:X} - Cycle {}", cpu.read_pc(), cycle/2);
         }
@@ -117,4 +119,15 @@ fn main() {
     print_status(&cpu, &memory);
     // TODO: figure out how much slower memset over a bitmap is than
     //       removing and remaking the big ass vec
+
+    /*
+    for k in cpu.state.freq
+    {
+        if k.1 > 5
+        {
+            println!("{:?}", k);
+        }
+    }
+    */
+
 }

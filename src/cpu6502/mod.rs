@@ -2,11 +2,13 @@ pub mod data;
 
 use data::*;
 use crate::sim::{ State, Group };
+use std::thread;
 
 pub struct CPU6502
 {
-    state: State,
+    pub state: State,
     group: Group,
+    group2: Group,
 }
 
 impl CPU6502
@@ -16,7 +18,8 @@ impl CPU6502
     {
         CPU6502 {
             state: State::new(&transdefs, &node_is_pullup, vss, vcc),
-            group: Group::new(node_is_pullup.len()),
+            group: Group::new(node_is_pullup.len(), transdefs.len()),
+            group2: Group::new(node_is_pullup.len(), transdefs.len()),
         }
     }
     
@@ -117,6 +120,17 @@ impl CPU6502
     pub fn read_data(&self) -> u8
     {
         self.state.read_nodes(&[db7, db6, db5, db4, db3, db2, db1, db0]) as u8
+    }
+
+    pub fn parallel_test(&mut self)
+    {
+        //self.state.recalc_node_dry()
+        /*
+        thread::spawn(||
+        {
+            
+        });
+        */
     }
     
 }

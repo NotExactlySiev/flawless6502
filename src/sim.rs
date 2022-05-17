@@ -2,16 +2,84 @@ use crate::types::*;
 use std::mem::swap;
 use std::time::*;
 use std::cmp::max;
-use ahash::{ AHashMap };
-use std::thread;
-use std::sync::Arc;
+use std::hash::{ Hash, Hasher, BuildHasher, BuildHasherDefault };
+use std::collections::HashMap;
+use twox_hash::XxHash64;
+use std::ops::{ Not, BitAnd, BitOr, BitAndAssign, BitOrAssign };
+use crossbeam::scope;
 
-#[derive(Debug, Hash)]
-struct Bitmap
+
+#[derive(Debug,Clone)]
+pub struct Bitmap
 {
     data: Vec<u64>,
     size: usize,
     vec_size: usize,
+}
+
+impl Hash for Bitmap
+{
+    fn hash<H: Hasher>(&self, state: &mut H)
+    {
+        self.size.hash(state);
+        self.data.hash(state);
+    }
+}
+
+impl Not for Bitmap
+{
+    type Output = Self;
+
+    fn not(mut self) -> Self
+    {
+        for i in 0..self.vec_size
+        {
+            self.data[i] = !self.data[i];
+        }
+        self
+    }
+}
+
+impl BitAnd for Bitmap
+{
+    type Output = Self;
+
+    fn bitand(mut self, rhs: Self) -> Self
+    {
+        if self.size != rhs.size
+        {
+            panic!("Bitmaps must be of equal size");
+        }
+
+        for i in 0..self.vec_size
+        {
+            self.data[i] &= rhs.data[i];
+        }
+
+        self
+    }
+}
+
+impl BitAndAssign for Bitmap
+{
+    fn bitand_assign(&mut self, rhs: Self)
+    {
+        for i in 0..self.vec_size
+        {
+            self.data[i] &= rhs.data[i];
+        }
+    }
+}
+
+impl BitOrAssign for Bitmap
+{
+    fn bitor_assign(&mut self, rhs: Self)
+    {
+        for i in 0..self.vec_size
+        {
+            self.data[i] |= rhs.data[i];
+        }
+    }
 }
 
 impl Bitmap
@@ -32,6 +100,12 @@ impl Bitmap
         self.data.resize(self.vec_size, 0);
     }
 
+    pub fn fill(&mut self)
+    {
+        self.data.clear();
+        self.data.resize(self.vec_size, u64::MAX);
+    }
+
     pub fn get_bit(&self, index: usize) -> bool
     {
         self.data[index / 64] & (1 << (index & (64-1))) != 0
@@ -50,6 +124,31 @@ impl Bitmap
         }
     }
 
+    // this could be simd maybe
+
+    pub fn not(&mut self)
+    {
+        for i in 0..self.vec_size
+        {
+            self.data[i] = !self.data[i]
+        }
+    }
+
+    pub fn and(&mut self, other: &Self)
+    {
+        for i in 0..self.vec_size
+        {
+            self.data[i] &= other.data[i];
+        }
+    }
+    
+    pub fn or(&mut self, other: &Self)
+    {
+        for i in 0..self.vec_size
+        {
+            self.data[i] |= other.data[i];
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,28 +174,42 @@ impl Connection
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Group
 {
     nodes: Vec<Node>,
     bitmap: Bitmap,
     value: GroupValue,
 
-    cache: Vec<AHashMap<u64, HashResult>>,
+    node_mask: Bitmap,
+    node_new: Bitmap,
+    tran_mask: Bitmap,
+    tran_new: Bitmap,
+    queue_new: Vec<Node>,
+    
+
+    //cache: Vec<HashMap<NodeFullState, HashResult, BuildHasherDefault<XxHash64>>>,
 }
 
 const CAPACITY: usize = 50;
 
 impl Group
 {
-    pub fn new(nodes_count: usize) -> Group
+    pub fn new(nodes_count: usize, trans_count: usize) -> Group
     {
         Group { 
             nodes: Vec::with_capacity(CAPACITY),
             bitmap: Bitmap::new(nodes_count),
             value: GroupValue::Nothing,
 
-            cache: vec![AHashMap::new(); nodes_count],
+            node_mask: Bitmap::new(nodes_count),
+            node_new: Bitmap::new(nodes_count),
+            tran_mask: Bitmap::new(trans_count),
+            tran_new: Bitmap::new(trans_count),
+
+            queue_new: Vec::with_capacity(nodes_count),
+
+            //cache: vec![Default::default(); nodes_count],
         }
     }
 
@@ -122,11 +235,16 @@ impl Group
     }
 
     #[inline]
-    fn clear(&mut self, state: &State)
+    fn clear(&mut self)
     {
         self.nodes.clear();
         self.value = GroupValue::Nothing;
         self.bitmap.clear();
+        self.node_mask.fill();
+        self.node_new.clear();
+        self.tran_mask.fill();
+        self.tran_new.clear();
+        self.queue_new.clear();
     }
 
     #[inline]
@@ -140,24 +258,14 @@ impl Group
     }
 
     #[inline]
-    fn node_status(&self, state: &State, node: Node) -> u64
+    fn node_status(&self, state: &State, node: Node) 
+        -> (bool,bool,bool,bool,Vec<bool>)
     {
-        // hood size is less than 32
-        let hood = state.get_connections(node);
-        let size = hood.len();
-
-        let mut bitmap: u64 = 0;
-        
-        for c in hood.iter()
-        {
-            bitmap <<= 1;
-            bitmap += state.tran_is_on(c.t) as u64;
-        }
-
-           ((state.node_value(node) as u64) << size)
-         | ((state.node_is_pulldown(node) as u64) << (size + 1))
-         | ((state.node_is_pullup(node) as u64) << (size + 2))
-         | ((self.contains(node) as u64) << (size + 3))
+        (state.node_value(node),
+         state.node_is_pulldown(node),
+         state.node_is_pullup(node),
+         self.contains(node),
+         state.get_connections(node).iter().map(|c| state.tran_is_on(c.t)).collect::<Vec<bool>>())
     }
 
     // only simulates what happens if we add node. doesn't change state
@@ -213,6 +321,7 @@ impl Group
     }
 
     pub fn add_node_to_group(&mut self, state: &State, node: Node)
+        -> u64
     {
         //let n = Instant::now();
 
@@ -222,32 +331,35 @@ impl Group
         let hood = state.get_connections(node).iter();
 
 
-        if hood.len() < 10 || hood.len() > 32 
+        if hood.len() >= 0
         {
-            self.add_node_to_group_old(state, node);
-            return;
+            return self.add_node_to_group_old(state, node);
+        }
+        else
+        {
+            return 0;
         }
 
-       
-        let mut hash: u64 = 0;
+        //println!("hashing!");
         
-        hash += self.value as u64;
-        hash <<= 3;
-        hash += self.node_status(state, node);
+        /*
 
-        for h in hood.filter(|c| state.tran_is_on(c.t))
+        let hood_state = hood.filter(|c| state.tran_is_on(c.t))
             .map(|c| self.node_status(state, c.other))
-        {
-            hash *= h;  
-            hash <<= 4;
-        }
+            .collect::<Vec<NodeState>>();
+
+        let node_state = (
+            self.value,
+            self.node_status(state, node),
+            hood_state
+        );
 
         // Second: if this exact state has already been simulated,
         //         just use the previous result to advance 2 steps
-        if self.cache[node].contains_key(&hash)
+        if self.cache[node].contains_key(&node_state)
         {
             //println!("using hash!");
-            let result = &self.cache[node][&hash].clone();
+            let result = &self.cache[node][&node_state].clone();
 
             self.value = result.new_value;
 
@@ -333,21 +445,23 @@ impl Group
                                 new_value: new_val,
                             };
 
-        self.cache[node].insert(hash, hash_result);
+        self.cache[node].insert(node_state, hash_result);
         
 
         // finally call the function again. this time we have the
         // hash result and it'll be applied to the group
         self.add_node_to_group(state, node);
+        */
     }
 
     pub fn add_node_to_group_old(&mut self, state: &State, node: Node)
+        -> u64
     {
             if node == state.vss
             {
                 self.value = GroupValue::Vss;
                 //continue;
-                return;
+                return 0;
             }
             
             if node == state.vcc
@@ -357,12 +471,12 @@ impl Group
                     self.value = GroupValue::Vcc;
                 }
                 //continue;
-                return;
+                return 0;
             }
             
             if self.contains(node)
             {
-                return;
+                return 0;
             }
             
             self.add(node);
@@ -382,11 +496,15 @@ impl Group
                 self.value = GroupValue::High;
             } 
 
+            let mut sum = 0;
+
             for c in state.get_connections(node).iter()
                 .filter(|c| state.tran_is_on(c.t))
             {
-                self.add_node_to_group_old(state, c.other);
+                sum += self.add_node_to_group_old(state, c.other);
             }
+
+            return sum + 1;
     }
 }
 
@@ -428,11 +546,27 @@ pub struct State
     // Nodes that we should work on
     queue: Vec<Node>,
 
+
+    pub freq: HashMap<u64, u64>,
+    cache: HashMap<u64, Group>,
 }
 
 
+impl Hash for State
+{
+    fn hash<H: Hasher>(&self, state: &mut H)
+    {
+        self.node_is_pullup.hash(state);
+        self.node_is_pulldown.hash(state);
+        self.node_value.hash(state);
+        self.tran_is_on.hash(state);
+    }
+}
+
 impl State
 {
+
+
     pub fn new(trans: &[Transistor], pullup: &[i32], vss: Node, vcc: Node)
         -> State
     {
@@ -446,26 +580,28 @@ impl State
             vss,
             vcc,
 
-            node_is_pullup: Bitmap::new(nodes_count),
-            node_is_pulldown: Bitmap::new(nodes_count),
-            node_value: Bitmap::new(nodes_count),
-
             node_gates: vec![Vec::with_capacity(CAPACITY); nodes_count],
 
             node_depend: vec![Vec::with_capacity(CAPACITY); nodes_count],
             node_depend_left: vec![Vec::with_capacity(CAPACITY); nodes_count],
-
             node_connections: Vec::new(),
             connections_offset: vec![0usize; nodes_count+1],
 
             tran_gate: trans.into_iter().map(|t| t.0).collect(),
             tran_a: trans.into_iter().map(|t| t.1).collect(),
             tran_b: trans.into_iter().map(|t| t.2).collect(),
-            tran_is_on: Bitmap::new(trans_count),
 
             current: Vec::new(),
             queue: Vec::new(),
 
+            // fields containing mutable state
+            node_is_pullup: Bitmap::new(nodes_count),
+            node_is_pulldown: Bitmap::new(nodes_count),
+            node_value: Bitmap::new(nodes_count),
+            tran_is_on: Bitmap::new(trans_count),
+
+            freq: Default::default(),
+            cache: Default::default(),
         };
 
         pullup.iter().enumerate()
@@ -580,16 +716,109 @@ impl State
     }
 
     #[inline]
-    pub fn recalc_node(&mut self, node: Node, mut group: &mut Group)
+    pub fn recalc_node_dry(&self, node: Node, mut group: &mut Group)
     {
-        group.clear(&self);
         group.add_node_to_group(self, node);
 
-            let newv = group.binary_value();
+        let newv = group.binary_value();
+        
+        for n in group.nodes.iter()
+        {
+            if self.node_value(*n) != newv
+            {
+                group.node_mask.set_bit(*n, false);    
+                group.node_new.set_bit(*n, newv);
+                for t in &self.node_gates[*n]
+                {
+                    group.tran_mask.set_bit(*t, false);    
+                    group.tran_new.set_bit(*t, newv);
+                }
+
+                let depend = if newv 
+                    { &self.node_depend_left } else { &self.node_depend };
+
+                for nn in depend[*n].iter()
+                {
+                    group.queue_new.push(*nn);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn recalc_node<'a>(&'a mut self, node: Node, mut group: &'a mut Group)
+    {
+        group.clear();
+        self.recalc_node_dry(node, group);
+
+        self.node_value.and(&group.node_mask);
+        self.node_value.or(&group.node_new);
+
+        self.tran_is_on.and(&group.tran_mask);
+        self.tran_is_on.or(&group.tran_new);
+        
+        for n in group.queue_new.iter()
+        {
+            self.queue.push(*n);
+        }
+
+        return;
+        /*        
+        let mut g: &Group;
+
+        if self.get_connections(node).len() > 8
+        {
+
+        let mut h = XxHash64::with_seed(node as u64);
+
+        self.hash(&mut h);
+
+
+        let hash = h.finish();
+
+
+        if self.cache.contains_key(&hash)
+        {
+            g = &self.cache[&hash];
+        }
+        else
+        {
+            group.add_node_to_group(self, node);
+            g = group; 
+
+            if self.freq.contains_key(&hash)
+            {
+                *self.freq.get_mut(&hash).unwrap() += 1;
+                if self.freq[&hash] > 1
+                {
+                    self.cache.insert(hash, g.clone());   
+                }
+            }
+            else
+            {
+                self.freq.insert(hash, 1);
+            }
+
+        }
+
+        }
+        else
+        {
+            group.clear(self);
+            group.add_node_to_group(self, node);
+            g = group;
+        }*/
+
+        group.clear();
+
+        let t = group.add_node_to_group(self, node);
+
+        let g = group;
+        let newv = g.binary_value();
         // set all nodes to the group state
         // check and switch all the transistors connected
         // collect all nodes connected to those transistors
-        for n in group.nodes.iter()
+        for n in g.nodes.iter()
         {
              if self.node_value(*n) != newv
              {
@@ -601,7 +830,9 @@ impl State
 
                 let depend = if newv 
                     { &self.node_depend_left } else { &self.node_depend };
-                
+
+                println!("{:?}", depend[*n]);
+
                 for nn in depend[*n].iter()
                 {
                     self.queue.push(*nn);
@@ -617,9 +848,8 @@ impl State
         //let mut total_time = 0;
         for _ in 0..100
         {
-            let n = Instant::now();
             self.list_switch();
-
+        
             if self.current.len() == 0
             {
                 break;
